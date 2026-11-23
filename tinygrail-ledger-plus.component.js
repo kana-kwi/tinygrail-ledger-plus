@@ -2,7 +2,7 @@
  * 小圣杯账本2.0（tinygrail-ledger-plus）
  * 独立账本组件：全量读取资金日志（不设页数上限），IndexedDB 长期记忆。
  * 统计口径 / 界面沿用「小圣杯工具箱」账本，经命名空间隔离后抽离，二者可同时启用。
- * 版本 v1.5.42（修复 IDB 初始化并发竞态导致前几批写入静默丢失；清空事务补 meta scope 并等待提交）
+ * 版本 v1.6.0（多账号独立存档：换号切库不清库、切回直接复用；顶栏显示账号并提供账号管理，可删除单个账号存档）
  */
 (function () {
   'use strict';
@@ -1987,6 +1987,26 @@
 .tglp-topbar{flex:0 0 auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
   padding:7px 14px;border-bottom:1px solid var(--tl-line-soft);background:var(--tl-surface)}
 .tglp-brand{font-size:13px;font-weight:650;color:var(--tl-fg);white-space:nowrap;margin-right:2px}
+.tglp-user{font-size:11px;color:var(--tl-dim);max-width:150px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;margin-right:4px}
+.tglp-topbar{position:relative}
+.tglp-acctbtn{height:24px;padding:0 8px;border:1px solid var(--tl-line-soft);border-radius:6px;
+  background:var(--tl-surface);color:var(--tl-dim);font:inherit;font-size:11px;cursor:pointer}
+.tglp-acctbtn:hover{color:var(--tl-accent)}
+.tglp-acctmenu{position:absolute;top:calc(100% + 6px);left:8px;z-index:30;width:300px;
+  background:var(--tl-surface);border:1px solid var(--tl-line-soft);border-radius:10px;
+  box-shadow:0 10px 28px rgba(0,0,0,.2);padding:8px;color:var(--tl-fg2)}
+.tglp-acctmenu[hidden]{display:none}
+.tglp-acct-title{font-size:11px;color:var(--tl-dim);padding:4px 6px 6px;font-weight:600}
+.tglp-acct-row{display:flex;align-items:center;gap:8px;padding:6px;border-radius:8px}
+.tglp-acct-row.tglp-on{background:var(--tl-sunken2)}
+.tglp-acct-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.tglp-acct-meta{font-size:11px;color:var(--tl-dim);white-space:nowrap}
+.tglp-acct-del{flex:0 0 auto;border:1px solid var(--tl-line-soft);background:transparent;color:var(--tl-dim);
+  border-radius:6px;font-size:11px;padding:2px 8px;cursor:pointer}
+.tglp-acct-del:hover{color:var(--tl-down,#c0392b);border-color:var(--tl-down,#c0392b)}
+.tglp-acct-empty,.tglp-acct-tip{font-size:11px;color:var(--tl-dim);padding:6px}
+.tglp-acct-tip{border-top:1px solid var(--tl-line-soft);margin-top:6px}
 .tglp-topbar .tglp-line{margin:0;gap:5px}
 .tglp-topbar .tglp-label{font-size:11px;color:var(--tl-dim);white-space:nowrap}
 .tglp-topbar select,.tglp-topbar input[type=date]{height:25px;padding:0 5px;font-size:12px;border-radius:5px}
@@ -2216,12 +2236,31 @@
    */
   const charaLvCache = Object.create(null);
   const favLvCache = Object.create(null);
-  const DB_NAME = 'tglp-ledger';
+  const DB_BASE = 'tglp-ledger';
   const DB_VER = 1;
   const LS_FALLBACK = 'tglp:logdb:v1';
   const Store = {
     db: null,
     ready: false,
+    dbName: DB_BASE,
+    accountKey: '',
+    _initP: null,
+    _dbName(key) { return key ? DB_BASE + ':' + key : DB_BASE; },
+    close() {
+      try { if (this.db) this.db.close(); } catch (e) {}
+      this.db = null;
+      this.ready = false;
+      this._initP = null;
+    },
+    /** 切到某个账号的独立存档库；账号之间互不覆盖，切回来直接复用。 */
+    async use(key) {
+      const k = String(key || '');
+      if (k === this.accountKey) return;
+      this.close();
+      this.accountKey = k;
+      this.dbName = this._dbName(k);
+      await this.init();
+    },
     async init() {
       if (this.ready) return;
       // 并发调用必须等同一个初始化 Promise。之前用 _initDone 标记，第二个调用者会
@@ -2233,7 +2272,7 @@
             if (!HWIN.indexedDB) throw new Error('no idb');
             this.db = await Promise.race([
               new Promise((res, rej) => {
-                const q = HWIN.indexedDB.open(DB_NAME, DB_VER);
+                const q = HWIN.indexedDB.open(this.dbName, DB_VER);
                 q.onupgradeneeded = () => {
                   const d = q.result;
                   if (!d.objectStoreNames.contains('logs')) d.createObjectStore('logs', { keyPath: 'k' });
@@ -2245,7 +2284,7 @@
               }),
               // file:// / 某些隐私模式下 IndexedDB 的 open 既不成功也不失败，挂死 Promise。
               // 给个超时退回 localStorage，别让整个组件永远停在初始化。
-              new Promise((_, rej) => setTimeout(() => rej(new Error('idb timeout')), 1200)),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('idb timeout')), 5000)),
             ]);
             this.ready = true;
           } catch (e) {
@@ -2256,19 +2295,21 @@
       }
       return this._initP;
     },
-    _memAll() {
-      try { return JSON.parse(HWIN.localStorage.getItem(LS_FALLBACK) || '[]') || []; }
+    _memKey(key) { return LS_FALLBACK + (key ? ':' + key : ''); },
+    _memAllOf(key) {
+      try { return JSON.parse(HWIN.localStorage.getItem(this._memKey(key)) || '[]') || []; }
       catch (e) { return []; }
     },
+    _memAll() { return this._memAllOf(this.accountKey); },
     _memPut(list) {
       try {
         const cur = this._memAll();
         const map = new Map(cur.map((r) => [r.k, r]));
         list.forEach((r) => map.set(r.k, r));
-        HWIN.localStorage.setItem(LS_FALLBACK, JSON.stringify([...map.values()]));
+        HWIN.localStorage.setItem(this._memKey(this.accountKey), JSON.stringify([...map.values()]));
       } catch (e) {}
     },
-    _memClear() { try { HWIN.localStorage.removeItem(LS_FALLBACK); } catch (e) {} },
+    _memClear() { try { HWIN.localStorage.removeItem(this._memKey(this.accountKey)); } catch (e) {} },
     async all() {
       await this.init();
       if (!this.ready) return this._memAll();
@@ -2315,6 +2356,50 @@
         } catch (e) { res(); }
       });
       this._memClear();
+    },
+    /** 删除某个账号的存档（若删的是当前库，先关闭连接）。 */
+    async destroy(key) {
+      const k = String(key || '');
+      const name = this._dbName(k);
+      if (name === this.dbName) this.close();
+      try { HWIN.localStorage.removeItem(this._memKey(k)); } catch (e) {}
+      if (!HWIN.indexedDB) return true;
+      return new Promise((res) => {
+        try {
+          const q = HWIN.indexedDB.deleteDatabase(name);
+          q.onsuccess = () => res(true);
+          q.onerror = () => res(false);
+          q.onblocked = () => res(false);
+        } catch (e) { res(false); }
+      });
+    },
+    /** 某个账号存档的条数（账号管理面板用；打开后立即关闭，不切当前库）。 */
+    async countOf(key) {
+      const k = String(key || '');
+      const mem = this._memAllOf(k).length;
+      if (!HWIN.indexedDB) return mem;
+      const name = this._dbName(k);
+      return new Promise((res) => {
+        try {
+          const q = HWIN.indexedDB.open(name, DB_VER);
+          q.onupgradeneeded = () => {
+            const d = q.result;
+            if (!d.objectStoreNames.contains('logs')) d.createObjectStore('logs', { keyPath: 'k' });
+            if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'key' });
+          };
+          q.onsuccess = () => {
+            const db = q.result;
+            const done = (n) => { try { db.close(); } catch (e) {} res(Math.max(n, mem)); };
+            try {
+              const rq = db.transaction('logs', 'readonly').objectStore('logs').count();
+              rq.onsuccess = () => done(Number(rq.result) || 0);
+              rq.onerror = () => done(0);
+            } catch (e) { done(0); }
+          };
+          q.onerror = () => res(mem);
+          q.onblocked = () => res(mem);
+        } catch (e) { res(mem); }
+      });
     },
     async getMeta(key, def) {
       await this.init();
@@ -2711,6 +2796,174 @@
       holdAt = Date.now();
       if (els) renderLedger();
     } catch (e) {}
+  }
+
+  /* ============ 账号身份：顶栏显示 + 每个账号独立存档 ============ */
+  let accountName = '';
+  let acctEl = null;
+  let acctMenu = null;
+  let acctChecked = false;
+
+  const LS_OWNER = 'tglp:owner:v1';
+  const LS_ACCOUNTS = 'tglp:accounts:v1';
+
+  function getOwner() {
+    try { return String(HWIN.localStorage.getItem(LS_OWNER) || ''); } catch (e) { return ''; }
+  }
+  function setOwner(name) {
+    try { HWIN.localStorage.setItem(LS_OWNER, String(name || '')); } catch (e) {}
+  }
+
+  function listAccounts() {
+    try {
+      const arr = JSON.parse(HWIN.localStorage.getItem(LS_ACCOUNTS) || '[]');
+      return Array.isArray(arr) ? arr.filter((x) => x && x.key) : [];
+    } catch (e) { return []; }
+  }
+  function saveAccounts(arr) {
+    try { HWIN.localStorage.setItem(LS_ACCOUNTS, JSON.stringify(arr)); } catch (e) {}
+  }
+  function rememberAccount(key, name) {
+    const list = listAccounts();
+    const hit = list.find((x) => x.key === key);
+    if (hit) { hit.name = name || hit.name || key; hit.last = Date.now(); }
+    else list.push({ key, name: name || key, last: Date.now() });
+    saveAccounts(list);
+  }
+  function forgetAccount(key) {
+    saveAccounts(listAccounts().filter((x) => x.key !== key));
+  }
+
+  function setAcctLabel(name) {
+    if (name !== undefined) accountName = String(name || '');
+    if (!acctEl) return;
+    acctEl.textContent = accountName ? '@' + accountName : '@未登录';
+    acctEl.title = accountName
+      ? '当前小圣杯账号：' + accountName + '（每个账号的本地存档分开保存）'
+      : '未识别到登录账号';
+  }
+
+  async function resolveAccountName() {
+    // 优先问接口（实时、准确）；拿不到再退回小圣杯自己的缓存 / 页面徽章。
+    try {
+      const r = await api('account/recommend');
+      if (r && r.Hash) return String(r.Hash);
+    } catch (e) {}
+    return guessedUsername();
+  }
+
+  /** 升级迁移：旧版单库 tglp-ledger 的数据归给当前登录账号（只做一次，旧库保留不读）。 */
+  async function migrateLegacy(key) {
+    try {
+      if (HWIN.localStorage.getItem('tglp:migrated:v1')) return 0;
+      const legacy = await Store.all();
+      if (!legacy.length) { HWIN.localStorage.setItem('tglp:migrated:v1', '1'); return 0; }
+      await Store.use(key);
+      if (!(await Store.all()).length) await Store.put(legacy);
+      HWIN.localStorage.setItem('tglp:migrated:v1', '1');
+      return legacy.length;
+    } catch (e) { return 0; }
+  }
+
+  /**
+   * 对齐到 nm 的独立存档：切库而不是清库。
+   * 切回旧账号时直接复用它的日志与统计桶；只有该账号从未读过才需要全量扫描。
+   */
+  async function applyAccount(nm) {
+    const name = String(nm || '').trim();
+    if (!name) return { name: '', owner: '', switched: false, migrated: 0 };
+    const key = name.toLowerCase();
+    const prev = getOwner();
+    const migrated = await migrateLegacy(key);
+    await Store.use(key);
+    rememberAccount(key, name);
+    setOwner(key);
+    if (prev && prev !== key) {
+      logAllRaw = (await Store.all()).slice().sort((a, b) => b.t - a.t);
+      statBuckets = null;
+      holdAll = [];
+      invalidateStatsCache();
+      applyWindow();
+      if (logAllRaw.length) await initStatBuckets();
+      return { name, owner: prev, switched: true, migrated };
+    }
+    if (!prev) setOwner(key);
+    return { name, owner: prev || key, switched: false, migrated };
+  }
+
+  async function checkAccount(autoScan) {
+    if (acctChecked) return;
+    acctChecked = true;
+    const nm = await resolveAccountName();
+    const r = await applyAccount(nm);
+    setAcctLabel(r.name);
+    renderAcctMenu();
+    if (!r.switched) return;
+    setLogStatus(`已切换到账号 ${r.name}（本地 ${logAllRaw.length} 条），正在读取最新日志…`);
+    if (els) renderLedger();
+    if (autoScan) setTimeout(() => scanLogs(), 300);
+  }
+
+  /** 账号管理：删除某个账号的本地存档。 */
+  async function deleteAccount(key) {
+    const k = String(key || '');
+    if (!k) return;
+    const hit = listAccounts().find((x) => x.key === k);
+    const label = (hit && hit.name) || k;
+    const msg = '删除账号「' + label + '」的本地存档？\n下次登录该账号需要重新读取全部日志。';
+    try { if (!HWIN.confirm(msg)) return; } catch (e) {}
+    forgetAccount(k);
+    if (k === Store.accountKey) {
+      try { await Store.clear(); } catch (e) {}
+      await Store.destroy(k);
+      Store.accountKey = '';
+      Store.dbName = Store._dbName('');
+      Store.close();
+      logAllRaw = [];
+      logAll = [];
+      statBuckets = null;
+      holdAll = [];
+      invalidateStatsCache();
+      setOwner('');
+      applyWindow();
+      acctChecked = false;
+      if (els) renderLedger();
+      setLogStatus('已删除当前账号的本地存档，刷新页面后会重新读取');
+    } else {
+      await Store.destroy(k);
+    }
+    renderAcctMenu();
+  }
+
+  /** 账号管理下拉：列出所有本地存档，可逐条删除。 */
+  async function renderAcctMenu() {
+    if (!acctMenu) return;
+    const list = listAccounts().slice().sort((a, b) => (b.last || 0) - (a.last || 0));
+    const frag = HDOC.createDocumentFragment();
+    const pending = [];
+    frag.appendChild(h('div', { class: 'tglp-acct-title' }, '本地账号存档'));
+    if (!list.length) frag.appendChild(h('div', { class: 'tglp-acct-empty' }, '还没有账号存档'));
+    for (const rec of list) {
+      const on = rec.key === Store.accountKey;
+      const metaEl = h('span', { class: 'tglp-acct-meta' }, '—');
+      const del = h('button', { class: 'tglp-acct-del', type: 'button', title: '删除该账号的本地存档' }, '删除');
+      del.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        deleteAccount(rec.key);
+      });
+      frag.appendChild(h('div', { class: 'tglp-acct-row' + (on ? ' tglp-on' : '') },
+        h('span', { class: 'tglp-acct-name', title: rec.name || rec.key }, (on ? '● ' : '') + (rec.name || rec.key)),
+        metaEl,
+        del));
+      pending.push({ key: rec.key, metaEl });
+    }
+    frag.appendChild(h('div', { class: 'tglp-acct-tip' }, '切换账号请在小圣杯重新登录；这里只管理本地存档。'));
+    acctMenu.textContent = '';
+    acctMenu.appendChild(frag);
+    for (const r of pending) {
+      try { r.metaEl.textContent = String(await Store.countOf(r.key)) + ' 条'; } catch (e) {}
+    }
   }
 
   /* ============ 全范围增量扫描 ============
@@ -4222,8 +4475,30 @@ const st = cachedLedgerStats();
     const closeBtn = h('button', { class: 'tglp-close', type: 'button', title: '关闭' }, '×');
 
     /* 顶栏：范围 / 统计 / 复制 / 视角 全在一条线上，把竖向空间全部让给数据 */
+    const acctEl0 = h('span', { class: 'tglp-user' });
+    acctEl = acctEl0;
+    setAcctLabel(accountName);
+
+    const acctBtn = h('button', { class: 'tglp-iconbtn tglp-acctbtn', type: 'button', title: '账号管理' }, '账号');
+    acctMenu = h('div', { class: 'tglp-acctmenu' });
+    acctMenu.hidden = true;
+    acctBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      acctMenu.hidden = !acctMenu.hidden;
+      if (!acctMenu.hidden) renderAcctMenu();
+    });
+    HDOC.addEventListener('click', (e) => {
+      if (!acctMenu || acctMenu.hidden) return;
+      if (acctMenu.contains(e.target) || e.target === acctBtn) return;
+      acctMenu.hidden = true;
+    });
+
     const topbar = h('div', { class: 'tglp-topbar' },
       h('span', { class: 'tglp-brand' }, '小圣杯账本2.0'),
+      acctEl0,
+      acctBtn,
+      acctMenu,
       line('范围', lDays, lRangeWrap),
       h('span', { class: 'tglp-line' }, lRun, lCopy, chartToggle),
       h('span', { style: 'flex:1 1 auto;min-width:0' }),
@@ -4393,6 +4668,8 @@ const st = cachedLedgerStats();
     if (!els) buildUI();
     els.panel.hidden = false;
     renderLedger();
+    // 打开面板时校验账号：换账号登录后本地存档自动重建，不把两个账号的日志混在一起。
+    checkAccount(true);
   }
 
   function registerCustomizeTab(tries) {
@@ -4482,6 +4759,11 @@ const st = cachedLedgerStats();
         storeAll: () => Store.all(), storeReady: () => Store.ready,
         storeClear: () => Store.clear(),
         storePut: (list) => Store.put(list),
+        account: () => accountName,
+        applyAccount, resolveAccountName, checkAccount, listAccounts, deleteAccount,
+        storeAccount: () => Store.accountKey,
+        getMeta: (k, d) => Store.getMeta(k, d),
+        setMeta: (k, v) => Store.setMeta(k, v),
         table: () => ({
           cols: tableState.cols.length, rows: tableState.rows.length,
           page: tableState.page, size: tableState.size, pages: pageCount(),

@@ -20,6 +20,8 @@ const head = `<!doctype html><meta charset="utf-8"><title>testlp</title>
 const mock = `
 <script>
 (function () {
+  // file:// 下 IDB 初始化时快时慢，会让读写混用 IDB 与回退路径；测试统一走回退，保证确定性
+  try { Object.defineProperty(window, 'indexedDB', { value: undefined, configurable: true }); } catch (e) {}
   window.__calls = [];
   window.__PAGES = 0;
   window.__PAGE_SIZE = 200;
@@ -203,6 +205,9 @@ const test = `
   var out = document.getElementById('out');
   try {
   var lines = [];
+  var __tick = setInterval(function () {
+    try { out.textContent = lines.join('~|~') + '~|~TICK~|~'; } catch (e) {}
+  }, 2000);
   function ok(name, cond, detail) {
     lines.push((cond ? 'PASS ' : 'FAIL ') + name + (detail ? ' [' + detail + ']' : ''));
   }
@@ -1104,6 +1109,49 @@ const test = `
   await T.refreshStatBuckets();
   ok('无新日志时桶不重建', T.statBucketsInfo().count === T.state().raw, '');
 
+  /* ---------- 账号存档隔离 / 顶栏用户名 / 账号管理 ---------- */
+  var acctTxt = '';
+  for (var ai = 0; ai < 60 && acctTxt !== '@HASH'; ai++) {
+    acctTxt = (doc.querySelector('.tglp-user') || {}).textContent || '';
+    if (acctTxt !== '@HASH') await new Promise(function (r) { setTimeout(r, 25); });
+  }
+  ok('顶栏显示当前账号用户名', acctTxt === '@HASH', 'txt=' + acctTxt);
+  ok('顶栏有账号管理按钮', !!doc.querySelector('.tglp-acctbtn'), '');
+  doc.querySelector('.tglp-acctbtn').click();
+  var acctMenuEl = null;
+  for (var am = 0; am < 80; am++) {
+    acctMenuEl = doc.querySelector('.tglp-acctmenu');
+    if (acctMenuEl && !acctMenuEl.hidden && acctMenuEl.textContent.indexOf('本地账号存档') >= 0) break;
+    await new Promise(function (r) { setTimeout(r, 25); });
+  }
+  ok('账号管理面板可展开并列出存档',
+    !!acctMenuEl && !acctMenuEl.hidden && acctMenuEl.textContent.indexOf('本地账号存档') >= 0,
+    acctMenuEl ? acctMenuEl.textContent.slice(0, 60) : 'none');
+  if (acctMenuEl) acctMenuEl.hidden = true;
+
+  window.confirm = function () { return true; };
+  await T.storeClear();
+  await T.applyAccount('HASH');
+  await T.storePut([{ k: 'acc-h', t: 1, v: { Id: 'acc-h' } }]);
+  var h1 = (await T.storeAll()).length;
+
+  await T.applyAccount('another-user');
+  var o1 = (await T.storeAll()).length;
+
+  await T.applyAccount('HASH');
+  var h2 = (await T.storeAll()).length;
+  ok('切回旧账号恢复本地存档', h1 === 1 && o1 === 0 && h2 === 1,
+    'h1=' + h1 + ' o1=' + o1 + ' h2=' + h2);
+
+  var acctKeys = T.listAccounts().map(function (x) { return x.key; });
+  ok('账号列表记录两个账号', acctKeys.indexOf('hash') >= 0 && acctKeys.indexOf('another-user') >= 0,
+    acctKeys.join(','));
+
+  await T.deleteAccount('another-user');
+  var acctKeys2 = T.listAccounts().map(function (x) { return x.key; });
+  ok('删除账号后列表移除', acctKeys2.indexOf('another-user') < 0, acctKeys2.join(','));
+
+  clearInterval(__tick);
   out.textContent = lines.join('~|~') + '~|~END~|~';
   } catch (err) {
     out.textContent = lines.join('~|~') + '~|~FAIL 脚本异常 ' + (err && err.stack ? err.stack : err) + '~|~END~|~';
