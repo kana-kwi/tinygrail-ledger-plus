@@ -816,9 +816,29 @@
     }
   }
 
+  const LS_HOLD = 'tglp:hold:v1';
+  function holdShotLoad() {
+    try {
+      const o = JSON.parse(HWIN.localStorage.getItem(LS_HOLD) || 'null');
+      if (o && o.key === Store.accountKey && o.at && Array.isArray(o.items) && o.items.length) {
+        holdAll = o.items;
+        holdAt = o.at;
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function holdShotSave() {
+    try {
+      HWIN.localStorage.setItem(LS_HOLD, JSON.stringify({ key: Store.accountKey, at: holdAt, items: holdAll }));
+    } catch (e) {}
+  }
+
   /** 后台补持仓市值（资产卡的「持仓市值 / 合计」两格用） */
   async function loadHoldings() {
     if (holdAll.length && Date.now() - holdAt < 5 * 60 * 1000) return;
+    // 跨页面复用快照：同一账号 5 分钟内的持仓不再每个页面重新拉一遍
+    if (!holdAll.length && holdShotLoad()) return;
     try {
       const me = guessedUsername();
       let key = me || '';
@@ -832,6 +852,7 @@
       if (!r.items.length) return;
       holdAll = r.items;
       holdAt = Date.now();
+      holdShotSave();
       if (els) renderLedger();
     } catch (e) {}
   }
@@ -841,6 +862,7 @@
   let acctEl = null;
   let acctMenu = null;
   let acctChecked = false;
+  let loadedKey = null;
 
   const LS_OWNER = 'tglp:owner:v1';
   const LS_ACCOUNTS = 'tglp:accounts:v1';
@@ -917,29 +939,34 @@
     rememberAccount(key, name);
     setOwner(key);
     if (prev && prev !== key) {
-      logAllRaw = (await Store.all()).slice().sort((a, b) => b.t - a.t);
+      // 只切库，不在这里读全量：真正的读取交给 ensureLocal（打开面板时一次完成）
+      logAllRaw = [];
+      logAll = [];
       statBuckets = null;
       holdAll = [];
+      loadedKey = null;
       invalidateStatsCache();
-      applyWindow();
-      if (logAllRaw.length) await initStatBuckets();
       return { name, owner: prev, switched: true, migrated };
     }
     if (!prev) setOwner(key);
     return { name, owner: prev || key, switched: false, migrated };
   }
 
-  async function checkAccount(autoScan) {
-    if (acctChecked) return;
+  async function checkAccount() {
+    if (acctChecked) return { switched: false, name: accountName };
     acctChecked = true;
     const nm = await resolveAccountName();
     const r = await applyAccount(nm);
     setAcctLabel(r.name);
     renderAcctMenu();
-    if (!r.switched) return;
-    setLogStatus(`已切换到账号 ${r.name}（本地 ${logAllRaw.length} 条），正在读取最新日志…`);
-    if (els) renderLedger();
-    if (autoScan) setTimeout(() => scanLogs(), 300);
+    return r;
+  }
+
+  /** 打开面板时才把该账号的本地日志读进内存；同一账号只读一次。 */
+  async function ensureLocal() {
+    if (loadedKey === Store.accountKey && logAllRaw.length) return;
+    await loadLocal();
+    loadedKey = Store.accountKey;
   }
 
   /** 账号管理：删除某个账号的本地存档。 */
@@ -965,6 +992,7 @@
       setOwner('');
       applyWindow();
       acctChecked = false;
+      loadedKey = null;
       if (els) renderLedger();
       setLogStatus('已删除当前账号的本地存档，刷新页面后会重新读取');
     } else {
@@ -2702,12 +2730,15 @@ const st = cachedLedgerStats();
    * 个性化面板的脚本可能比组件晚就绪 → 轮询等待 chiiLib.ukagaka。
    */
   const PANEL_TAB = 'tglp_ledger';
-  function openLedger() {
+  async function openLedger() {
     if (!els) buildUI();
     els.panel.hidden = false;
+    // 打开面板时才校验账号、读本地存档、拉持仓：平时不占 IO / 内存。
+    const acc = await checkAccount();
+    await ensureLocal();
+    loadHoldings();
     renderLedger();
-    // 打开面板时校验账号：换账号登录后本地存档自动重建，不把两个账号的日志混在一起。
-    checkAccount(true);
+    if (acc && acc.switched) setTimeout(() => scanLogs(), 300);
   }
 
   function registerCustomizeTab(tries) {
@@ -2744,7 +2775,13 @@ const st = cachedLedgerStats();
             });
             const meta = $tabContent.find('#tglp-entry-meta');
             if (meta && meta.length) {
-              meta.text(`本地已存 ${logAllRaw.length} 条记录`);
+              const owner = getOwner();
+              if (!owner) meta.text('还没有本地存档');
+              else Store.countOf(owner).then((n) => {
+                try {
+                  if (meta && meta.length) meta.text(n ? `本地已存 ${n} 条记录（账号 ${owner}）` : '还没有本地存档');
+                } catch (e) {}
+              }).catch(() => {});
             }
           } catch (e) {}
         },
@@ -2769,11 +2806,8 @@ const st = cachedLedgerStats();
     style.textContent = CSS + '\n' + CSS_EXTRA;
     (HDOC.head || HDOC.documentElement).appendChild(style);
 
-    // 先铺本地数据（秒开），再后台补持仓
-    await loadLocal();
-    loadHoldings();
-
-    // 把入口注册进「个性化」面板（无悬浮胶囊）
+    // 启动只注册入口，不读全量日志、不拉持仓：账本没打开时不占 IO / 内存。
+    // 入口上的条数用 count 查询；真正的 loadLocal + loadHoldings 放在 openLedger 里。
     registerCustomizeTab(0);
 
     // Alt+L 兜底唤出（入口失效时仍可打开）。不用 Alt+T：工具箱的悬浮胶囊也用 Alt+T，

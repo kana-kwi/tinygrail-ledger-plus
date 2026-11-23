@@ -1,5 +1,5 @@
 /**
- * 小圣杯账本2.0 v1.6.0 —— 多账号存档 / 账号管理 / IDB 零丢失 / Alt+L
+ * 小圣杯账本2.0 v1.6.1 —— 启动懒加载 / 多账号存档 / 账号管理 / Alt+L
  */
 (function () {
   'use strict';
@@ -2491,8 +2491,27 @@
     }
   }
 
+  const LS_HOLD = 'tglp:hold:v1';
+  function holdShotLoad() {
+    try {
+      const o = JSON.parse(HWIN.localStorage.getItem(LS_HOLD) || 'null');
+      if (o && o.key === Store.accountKey && o.at && Array.isArray(o.items) && o.items.length) {
+        holdAll = o.items;
+        holdAt = o.at;
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function holdShotSave() {
+    try {
+      HWIN.localStorage.setItem(LS_HOLD, JSON.stringify({ key: Store.accountKey, at: holdAt, items: holdAll }));
+    } catch (e) {}
+  }
+
   async function loadHoldings() {
     if (holdAll.length && Date.now() - holdAt < 5 * 60 * 1000) return;
+    if (!holdAll.length && holdShotLoad()) return;
     try {
       const me = guessedUsername();
       let key = me || '';
@@ -2506,6 +2525,7 @@
       if (!r.items.length) return;
       holdAll = r.items;
       holdAt = Date.now();
+      holdShotSave();
       if (els) renderLedger();
     } catch (e) {}
   }
@@ -2514,6 +2534,7 @@
   let acctEl = null;
   let acctMenu = null;
   let acctChecked = false;
+  let loadedKey = null;
 
   const LS_OWNER = 'tglp:owner:v1';
   const LS_ACCOUNTS = 'tglp:accounts:v1';
@@ -2584,29 +2605,32 @@
     rememberAccount(key, name);
     setOwner(key);
     if (prev && prev !== key) {
-      logAllRaw = (await Store.all()).slice().sort((a, b) => b.t - a.t);
+      logAllRaw = [];
+      logAll = [];
       statBuckets = null;
       holdAll = [];
+      loadedKey = null;
       invalidateStatsCache();
-      applyWindow();
-      if (logAllRaw.length) await initStatBuckets();
       return { name, owner: prev, switched: true, migrated };
     }
     if (!prev) setOwner(key);
     return { name, owner: prev || key, switched: false, migrated };
   }
 
-  async function checkAccount(autoScan) {
-    if (acctChecked) return;
+  async function checkAccount() {
+    if (acctChecked) return { switched: false, name: accountName };
     acctChecked = true;
     const nm = await resolveAccountName();
     const r = await applyAccount(nm);
     setAcctLabel(r.name);
     renderAcctMenu();
-    if (!r.switched) return;
-    setLogStatus(`已切换到账号 ${r.name}（本地 ${logAllRaw.length} 条），正在读取最新日志…`);
-    if (els) renderLedger();
-    if (autoScan) setTimeout(() => scanLogs(), 300);
+    return r;
+  }
+
+  async function ensureLocal() {
+    if (loadedKey === Store.accountKey && logAllRaw.length) return;
+    await loadLocal();
+    loadedKey = Store.accountKey;
   }
 
   async function deleteAccount(key) {
@@ -2631,6 +2655,7 @@
       setOwner('');
       applyWindow();
       acctChecked = false;
+      loadedKey = null;
       if (els) renderLedger();
       setLogStatus('已删除当前账号的本地存档，刷新页面后会重新读取');
     } else {
@@ -4272,11 +4297,14 @@ const st = cachedLedgerStats();
   }
 
   const PANEL_TAB = 'tglp_ledger';
-  function openLedger() {
+  async function openLedger() {
     if (!els) buildUI();
     els.panel.hidden = false;
+    const acc = await checkAccount();
+    await ensureLocal();
+    loadHoldings();
     renderLedger();
-    checkAccount(true);
+    if (acc && acc.switched) setTimeout(() => scanLogs(), 300);
   }
 
   function registerCustomizeTab(tries) {
@@ -4311,7 +4339,13 @@ const st = cachedLedgerStats();
             });
             const meta = $tabContent.find('#tglp-entry-meta');
             if (meta && meta.length) {
-              meta.text(`本地已存 ${logAllRaw.length} 条记录`);
+              const owner = getOwner();
+              if (!owner) meta.text('还没有本地存档');
+              else Store.countOf(owner).then((n) => {
+                try {
+                  if (meta && meta.length) meta.text(n ? `本地已存 ${n} 条记录（账号 ${owner}）` : '还没有本地存档');
+                } catch (e) {}
+              }).catch(() => {});
             }
           } catch (e) {}
         },
@@ -4333,9 +4367,6 @@ const st = cachedLedgerStats();
     style.id = 'tglp-style';
     style.textContent = CSS + '\n' + CSS_EXTRA;
     (HDOC.head || HDOC.documentElement).appendChild(style);
-
-    await loadLocal();
-    loadHoldings();
 
     registerCustomizeTab(0);
 

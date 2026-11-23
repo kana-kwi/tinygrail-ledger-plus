@@ -218,6 +218,7 @@ const test = `
   if (!T) { out.textContent = lines.join('~|~') + '~|~END~|~'; return; }
 
   T.buildUI();
+  ok('启动时不发账号/持仓请求（懒加载生效）', window.__calls.length === 0, 'calls=' + window.__calls.length);
 
   /* ---------- ① 全范围读取：160 页 ---------- */
   await T.storeClear();
@@ -333,7 +334,7 @@ const test = `
   // 全屏面板
   ok('全屏面板存在', !!doc.getElementById('tglp-panel'), '');
   ok('不再有悬浮胶囊', !doc.getElementById('tglp-fab'), '');
-  T.openLedger();
+  await T.openLedger();
   ok('openLedger 能打开面板', T.state().panel, '');
 
   // KPI 卡片
