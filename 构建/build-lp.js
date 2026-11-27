@@ -198,7 +198,7 @@ out.push(`/*!
  * 小圣杯账本2.0（tinygrail-ledger-plus）
  * 独立账本组件：全量读取资金日志（不设页数上限），IndexedDB 长期记忆。
  * 统计口径 / 界面沿用「小圣杯工具箱」账本，经命名空间隔离后抽离，二者可同时启用。
- * 版本 v1.6.7（新增油猴版：无超合金面板时自动显示右下角悬浮球入口；组件版仍走个性化 Tab）
+ * 版本 v1.6.8（油猴版入口改为脚本菜单 GM_registerMenuCommand，不显示悬浮球；沙箱用 unsafeWindow 访问页面）
  */
 (function () {
   'use strict';

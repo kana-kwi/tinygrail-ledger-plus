@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小圣杯账本2.0
 // @namespace    https://github.com/kana-kwi/tinygrail-ledger-plus
-// @version      1.6.7
+// @version      1.6.8
 // @description  读取小圣杯资金日志并统计：资金 / 股数 / 圣殿 / 星之力四个板块，多账号本地存档，增量统计，不设页数上限。
 // @author       kana-kwi
 // @homepageURL  https://github.com/kana-kwi/tinygrail-ledger-plus
@@ -9,28 +9,33 @@
 // @match        https://bgm.tv/*
 // @match        https://bangumi.tv/*
 // @match        https://chii.in/*
-// @grant        none
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @noframes
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
 
 (function () {
   'use strict';
+  const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
   // 已装超合金组件时交给组件，避免两个面板同时启动
-  try { if (window.top && window.top.__TGLP_UI_OWNER__) return; } catch (e) {}
+  try { if (W.top && W.top.__TGLP_UI_OWNER__) return; } catch (e) {}
 /*!
  * 小圣杯账本2.0（tinygrail-ledger-plus）
  * 独立账本组件：全量读取资金日志（不设页数上限），IndexedDB 长期记忆。
  * 统计口径 / 界面沿用「小圣杯工具箱」账本，经命名空间隔离后抽离，二者可同时启用。
- * 版本 v1.6.7（新增油猴版：无超合金面板时自动显示右下角悬浮球入口；组件版仍走个性化 Tab）
+ * 版本 v1.6.8（油猴版入口改为脚本菜单 GM_registerMenuCommand，不显示悬浮球；沙箱用 unsafeWindow 访问页面）
  */
 (function () {
   'use strict';
 
   /* ============ 环境探测（沿用工具箱：尽量挂在顶层 document） ============ */
   const HOST = (function () {
-    try { return window.top && window.top.document ? window.top : window; }
-    catch (e) { return window; }
+    try {
+      const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      return W.top && W.top.document ? W.top : W;
+    } catch (e) { return window; }
   })();
   const HDOC = HOST.document || document;
   const HWIN = HOST;
@@ -2036,10 +2041,7 @@
 .tglp-datesel{height:24px;border:1px solid var(--tl-line-soft);border-radius:5px;
   background:var(--tl-surface);color:var(--tl-fg2);font:inherit;font-size:11px;padding:0 2px}
 .tglp-date-sep{color:var(--tl-dim);font-style:normal;font-size:11px}
-.tglp-fab{position:fixed;right:18px;bottom:18px;z-index:9999;padding:9px 16px;border-radius:999px;
-  background:#e0a458;color:#2a1b06;font:600 12px/1.2 system-ui,sans-serif;cursor:pointer;
-  box-shadow:0 4px 16px rgba(0,0,0,.28);user-select:none}
-.tglp-fab:hover{filter:brightness(1.06)}
+
 .tglp-topbar .tglp-line{margin:0;gap:5px}
 .tglp-topbar .tglp-label{font-size:11px;color:var(--tl-dim);white-space:nowrap}
 .tglp-topbar select,.tglp-topbar input[type=date]{height:25px;padding:0 5px;font-size:12px;border-radius:5px}
@@ -4904,24 +4906,13 @@ const st = cachedLedgerStats();
     if (acc && acc.switched && logAllRaw.length) setTimeout(() => scanLogs(), 300);
   }
 
-  /** 油猴版没有超合金面板：chiiLib 不存在时用右下角悬浮球作为入口 */
-  function ensureFab() {
-    try {
-      if (!HDOC || HDOC.getElementById('tglp-fab')) return;
-      const fab = h('div', { id: 'tglp-fab', class: 'tglp-fab', title: '小圣杯账本2.0' }, '账本');
-      fab.addEventListener('click', () => openLedger());
-      HDOC.body.appendChild(fab);
-    } catch (e) {}
-  }
-
   function registerCustomizeTab(tries) {
     const uk = (function () {
       try { return HWIN.chiiLib && HWIN.chiiLib.ukagaka; } catch (e) { return null; }
     })();
     if (!uk || typeof uk.addPanelTab !== 'function') {
-      // 超合金面板晚就绪时等一等（约 3 秒）；油猴版没有 chiiLib，超时后用悬浮球入口
+      // 超合金面板晚就绪时等一等（约 3 秒）
       if ((tries || 0) < 15) HWIN.setTimeout(() => registerCustomizeTab((tries || 0) + 1), 200);
-      else ensureFab();
       return;
     }
     try {
@@ -4992,6 +4983,13 @@ const st = cachedLedgerStats();
         openLedger();
       }
     });
+
+    // 油猴版入口：脚本菜单（组件环境没有 GM_registerMenuCommand，自动跳过）
+    try {
+      if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('打开小圣杯账本', () => openLedger());
+      }
+    } catch (e) {}
   }
 
   /* ============ 测试钩子 ============ */
