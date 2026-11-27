@@ -227,8 +227,8 @@ const test = `
   window.__extraHead = 0;
   window.__calls.length = 0;
 
-  // 自定义窗口覆盖全部时间（2006 ~ 2036），确保 160 页都算进来
-  T.setRange('2006-01-01', '2036-01-01', 'custom');
+  // 自定义窗口覆盖全部时间（最早可选 2019-07-01 ~ 2036），确保 160 页都算进来
+  T.setRange('2019-07-01', '2036-01-01', 'custom');
   await T.scanLogs();
   await wait(50);
 
@@ -1164,7 +1164,7 @@ const test = `
   window.__PAGES = 160;
   window.__extraHead = 0;
   window.__calls.length = 0;
-  T.setRange('2000-01-01', '2030-01-01', 'custom');
+  T.setRange('2019-07-01', '2030-01-01', 'custom');
   var cutoffTs = Date.parse('2026-10-31T00:00:00') - 50 * 1000000;
   await T.scanLogs({ mode: 'range', cutoff: cutoffTs });
   var rawRange = T.state().raw;
@@ -1189,9 +1189,45 @@ const test = `
   ok('切到全量自动补更早历史', rawFull >= 320, 'raw=' + rawFull);
   ok('补全后标记为已全量', !!T.archiveFullGet(), 'full=' + T.archiveFullGet());
 
+  /* ---------- 自定义日期：年/月/日下拉，下限 2019-07-01 ---------- */
+  var lFromY = doc.getElementById('tglp-lfrom-y');
+  var lFromM = doc.getElementById('tglp-lfrom-m');
+  var lToY = doc.getElementById('tglp-lto-y');
+  ok('日期年份下拉从 2019 开始',
+    !!lFromY && !!lToY && lFromY.options[0].value === '2019' && lToY.options[0].value === '2019',
+    (lFromY ? lFromY.options[0].value : 'none') + ' / ' + (lToY ? lToY.options[0].value : 'none'));
+
+  if (lFromY && lFromM) {
+    lFromY.value = '2019';
+    lFromY.dispatchEvent(new Event('change'));
+    var mFirst = lFromM.options[0].value;
+    var mLast = lFromM.options[lFromM.options.length - 1].value;
+    ok('2019 年月份只列 7–12', mFirst === '7' && mLast === '12', mFirst + '~' + mLast);
+
+    lFromY.value = '2020';
+    lFromY.dispatchEvent(new Event('change'));
+    ok('2020 年月份恢复 1–12', lFromM.options[0].value === '1', lFromM.options[0].value);
+  }
+
+  await T.storePut([{ k: 'other-out-test', t: Date.now(),
+    v: { Id: 'other-out-test', LogTime: new Date().toISOString(), Type: 99, Change: -50, Amount: 0,
+      Description: '无法归类的支出', Balance: 0 } }]);
+  await T.loadLocal();
+  T.renderLedger();
+  var outCard = null;
+  var cards = doc.querySelectorAll('.tglp-chartcard');
+  for (var ci2 = 0; ci2 < cards.length; ci2++) {
+    if (cards[ci2].textContent.indexOf('资金支出 · 来源占比') >= 0) { outCard = cards[ci2]; break; }
+  }
+  var hasOther = T.ledgerStats().fundOut.rows.some(function (r) { return r.key === 'other'; });
+  ok('支出占比卡不含股息税/个人所得税',
+    !!outCard && hasOther && outCard.textContent.indexOf('股息税') < 0 && outCard.textContent.indexOf('个人所得税') < 0,
+    'card=' + (outCard ? outCard.textContent.slice(0, 50) : 'none') + ' other=' + hasOther);
+
   clearInterval(__tick);
   out.textContent = lines.join('~|~') + '~|~END~|~';
   } catch (err) {
+    clearInterval(__tick);
     out.textContent = lines.join('~|~') + '~|~FAIL 脚本异常 ' + (err && err.stack ? err.stack : err) + '~|~END~|~';
   }
 })();

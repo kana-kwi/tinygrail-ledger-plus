@@ -50,6 +50,10 @@
 .tglp-firstrun[hidden]{display:none}
 .tglp-firstrun-t{font-size:12px;font-weight:600;color:var(--tl-fg);white-space:nowrap}
 .tglp-firstrun-d{font-size:11px;color:var(--tl-dim);flex:1 1 260px;line-height:1.5}
+.tglp-datewrap{display:inline-flex;align-items:center;gap:2px}
+.tglp-datesel{height:24px;border:1px solid var(--tl-line-soft);border-radius:5px;
+  background:var(--tl-surface);color:var(--tl-fg2);font:inherit;font-size:11px;padding:0 2px}
+.tglp-date-sep{color:var(--tl-dim);font-style:normal;font-size:11px}
 .tglp-topbar .tglp-line{margin:0;gap:5px}
 .tglp-topbar .tglp-label{font-size:11px;color:var(--tl-dim);white-space:nowrap}
 .tglp-topbar select,.tglp-topbar input[type=date]{height:25px;padding:0 5px;font-size:12px;border-radius:5px}
@@ -469,13 +473,25 @@
     },
   };
 
+  // 小圣杯日志最早从 2019 年 8 月开始，自定义范围下限定在 2019-07-01 留一点余量
+  const DATE_MIN = '2019-07-01';
+  const DATE_MAX = '2100-12-31';
+
+  /** 严格日期：YYYY-MM-DD，且不早于 DATE_MIN、不晚于 DATE_MAX（挡住 0006 这类分段输入产生的非法值） */
+  function dayMsStrict(v) {
+    const s = String(v || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+    if (s < DATE_MIN || s > DATE_MAX) return null;
+    return parseDayMs(s);
+  }
+
   /** 按当前窗口从全量本地记录里筛出统计数据源 */
   /** 统计窗口：支持「全部」 */
   function logRange() {
     if (String(S.logDays) === 'all') return { from: 0, to: 0, days: 0, all: true };
     if (String(S.logDays) === 'custom') {
-      const f = parseDayMs(S.logFrom);
-      const t = parseDayMs(S.logTo);
+      const f = dayMsStrict(S.logFrom);
+      const t = dayMsStrict(S.logTo);
       if (f != null || t != null) {
         const from = f != null ? f : t - 6 * 86400000;
         let to = (t != null ? t : from) + 86400000;
@@ -1918,7 +1934,10 @@ const st = cachedLedgerStats();
     }
 
     if (view === 'fund') {
-      const outRows = st.fundOut.rows.map((r) => ({ label: fundLabel('out', r.key), sum: r.sum, n: r.n }));
+      // 支出占比不含税类：other（股息税）与 tax（个人所得税）已在净股息口径里单独处理
+      const outRows = st.fundOut.rows
+        .filter((r) => r.key !== 'tax' && r.key !== 'other')
+        .map((r) => ({ label: fundLabel('out', r.key), sum: r.sum, n: r.n }));
       const inRows = st.fundIn.rows.map((r) => ({ label: fundLabel('in', r.key), sum: r.sum, n: r.n }));
       defs.fundOutChart = {
         title: '资金支出 · 来源占比', col: 'l',
@@ -2482,20 +2501,88 @@ const st = cachedLedgerStats();
     return w ? `${fmtDay(w.from)} ~ ${fmtDay(w.to - 1)}` : '';
   }
 
+  /** 年/月/日三个下拉：日历里不出现 2019-07-01 之前的日期（原生 date 的 min 只能置灰，无法隐藏） */
+  function makeDatePicker(tag, initial, onChange) {
+    const p = (() => {
+      const s = String(initial || '');
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+      if (m && s >= DATE_MIN && s <= DATE_MAX) {
+        return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
+      }
+      return { y: 2019, m: 7, d: 1 };
+    })();
+    const ySel = h('select', { class: 'tglp-datesel', id: 'tglp-' + tag + '-y', title: '年' });
+    const mSel = h('select', { class: 'tglp-datesel', id: 'tglp-' + tag + '-m', title: '月' });
+    const dSel = h('select', { class: 'tglp-datesel', id: 'tglp-' + tag + '-d', title: '日' });
+    const fillMonths = () => {
+      const minM = p.y === 2019 ? 7 : 1;
+      mSel.textContent = '';
+      for (let m = minM; m <= 12; m++) mSel.appendChild(h('option', { value: String(m) }, String(m) + '月'));
+      if (p.m < minM) p.m = minM;
+      mSel.value = String(p.m);
+    };
+    const fillDays = () => {
+      const n = new Date(p.y, p.m, 0).getDate();
+      dSel.textContent = '';
+      for (let d = 1; d <= n; d++) dSel.appendChild(h('option', { value: String(d) }, String(d) + '日'));
+      if (p.d > n) p.d = n;
+      dSel.value = String(p.d);
+    };
+    ySel.textContent = '';
+    for (let y = 2019; y <= 2100; y++) ySel.appendChild(h('option', { value: String(y) }, String(y) + '年'));
+    ySel.value = String(p.y);
+    fillMonths();
+    fillDays();
+    const emit = () => onChange(p.y + '-' + String(p.m).padStart(2, '0') + '-' + String(p.d).padStart(2, '0'));
+    ySel.addEventListener('change', () => { p.y = Number(ySel.value); fillMonths(); fillDays(); emit(); });
+    mSel.addEventListener('change', () => { p.m = Number(mSel.value); fillDays(); emit(); });
+    dSel.addEventListener('change', () => { p.d = Number(dSel.value); emit(); });
+    return {
+      el: h('span', { class: 'tglp-datewrap' },
+        ySel, h('i', { class: 'tglp-date-sep' }, '/'), mSel, h('i', { class: 'tglp-date-sep' }, '/'), dSel),
+      setValue: (v) => {
+        const s = String(v || '');
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+        if (!m || s < DATE_MIN || s > DATE_MAX) return;
+        p.y = Number(m[1]); p.m = Number(m[2]); p.d = Number(m[3]);
+        ySel.value = String(p.y);
+        fillMonths();
+        fillDays();
+      },
+    };
+  }
+
   /* ============ 面板壳（v1.1.0 大面板 + 两栏布局） ============ */
   function buildUI() {
     const lDays = select('tglp-ldays', [
       ['all', '全部'], ['3', '近 3 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天'], ['custom', '自定义'],
     ], String(S.logDays));
-    const lFrom = h('input', {
-      id: 'tglp-lfrom', type: 'date',
-      value: S.logFrom || dayStr(dayStartMs(6)), title: '起始日（含当天 0:00）',
-    });
-    const lTo = h('input', {
-      id: 'tglp-lto', type: 'date',
-      value: S.logTo || dayStr(dayStartMs(0)), title: '结束日（含当天 24:00）',
-    });
-    const lRangeWrap = h('span', { class: 'tglp-inline' }, lFrom, h('i', null, '~'), lTo);
+    // 日期改用年/月/日三个下拉：年份只列 2019–2100，2019 年时月份只列 7–12
+    // （原生 input[type=date] 的 min 只能把更早日期置灰，无法在日历里隐藏）
+    if (S.logDays === 'custom') {
+      if (!dayMsStrict(S.logFrom)) S.logFrom = DATE_MIN;
+      if (!dayMsStrict(S.logTo)) S.logTo = dayStr(dayStartMs(0));
+    }
+    const onDateCommit = () => {
+      const f = S.logFrom || '';
+      const t = S.logTo || '';
+      if (f && t && f > t) {
+        setLogStatus('起始日期不能晚于结束日期，请调整');
+        return;
+      }
+      persist();
+      applyWindow();
+      if (logAll.length) renderLedger();
+      else setLogStatus('本地没有这段时间的数据，点「统计」补读');
+      maybeBackfillHistory();
+    };
+    const dateFrom = makeDatePicker('lfrom', S.logFrom || dayStr(dayStartMs(6)), (v) => { S.logFrom = v; onDateCommit(); });
+    const dateTo = makeDatePicker('lto', S.logTo || dayStr(dayStartMs(0)), (v) => { S.logTo = v; onDateCommit(); });
+    const syncDateInputs = () => {
+      dateFrom.setValue(S.logFrom || dayStr(dayStartMs(6)));
+      dateTo.setValue(S.logTo || dayStr(dayStartMs(0)));
+    };
+    const lRangeWrap = h('span', { class: 'tglp-inline' }, dateFrom.el, h('i', null, '~'), dateTo.el);
     const syncRange = () => { lRangeWrap.hidden = String(S.logDays) !== 'custom'; };
     syncRange();
 
@@ -2656,7 +2743,7 @@ const st = cachedLedgerStats();
     closeBtn.addEventListener('click', () => { panel.hidden = true; });
 
     els = {
-      panel, lDays, lFrom, lTo, lRangeWrap, lDir, lKind, lTop,
+      panel, lDays, lRangeWrap, lDir, lKind, lTop,
       lRun, lCopy, profileBox, chartBox, chartCount, chartToggle,
       segBtns, sortWrap, starBar,
       starModeSel, starFilterSel, logStat,
@@ -2689,7 +2776,7 @@ const st = cachedLedgerStats();
         S.logDays = 'custom';
         if (!S.logFrom) S.logFrom = dayStr(dayStartMs(6));
         if (!S.logTo) S.logTo = dayStr(dayStartMs(0));
-        lFrom.value = S.logFrom; lTo.value = S.logTo;
+        syncDateInputs();
       } else if (lDays.value === 'all') {
         S.logDays = 'all';
         S.logFrom = ''; S.logTo = '';
@@ -2701,16 +2788,7 @@ const st = cachedLedgerStats();
       else setLogStatus('本地没有这段时间的数据，点「统计」补读');
       maybeBackfillHistory();
     });
-    [lFrom, lTo].forEach((inp) => inp.addEventListener('change', () => {
-      if (lFrom.value && lTo.value && lFrom.value > lTo.value) {
-        const t = lFrom.value; lFrom.value = lTo.value; lTo.value = t;
-      }
-      S.logFrom = lFrom.value || ''; S.logTo = lTo.value || '';
-      persist(); applyWindow();
-      if (logAll.length) renderLedger();
-      else setLogStatus('本地没有这段时间的数据，点「统计」补读');
-      maybeBackfillHistory();
-    }));
+
     lDir.addEventListener('change', () => {
       S.logDir = lDir.value === 'loss' ? 'loss' : 'gain';
       syncKindOpts(); lKind.value = S.logKind; persist();
