@@ -2,7 +2,7 @@
  * 小圣杯账本2.0（tinygrail-ledger-plus）
  * 独立账本组件：全量读取资金日志（不设页数上限），IndexedDB 长期记忆。
  * 统计口径 / 界面沿用「小圣杯工具箱」账本，经命名空间隔离后抽离，二者可同时启用。
- * 版本 v1.6.1（启动懒加载：账本未打开时不读全量日志、不拉持仓；持仓快照跨页面复用 5 分钟）
+ * 版本 v1.6.3（切到「全部」但本地未全量时先确认，防止误触大范围读取；其余同 v1.6.2）
  */
 (function () {
   'use strict';
@@ -2007,6 +2007,11 @@
 .tglp-acct-del:hover{color:var(--tl-down,#c0392b);border-color:var(--tl-down,#c0392b)}
 .tglp-acct-empty,.tglp-acct-tip{font-size:11px;color:var(--tl-dim);padding:6px}
 .tglp-acct-tip{border-top:1px solid var(--tl-line-soft);margin-top:6px}
+.tglp-firstrun{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px;
+  padding:10px 12px;border:1px solid var(--tl-line-soft);border-radius:10px;background:var(--tl-surface)}
+.tglp-firstrun[hidden]{display:none}
+.tglp-firstrun-t{font-size:12px;font-weight:600;color:var(--tl-fg);white-space:nowrap}
+.tglp-firstrun-d{font-size:11px;color:var(--tl-dim);flex:1 1 260px;line-height:1.5}
 .tglp-topbar .tglp-line{margin:0;gap:5px}
 .tglp-topbar .tglp-label{font-size:11px;color:var(--tl-dim);white-space:nowrap}
 .tglp-topbar select,.tglp-topbar input[type=date]{height:25px;padding:0 5px;font-size:12px;border-radius:5px}
@@ -2836,6 +2841,21 @@
     try { HWIN.localStorage.setItem(LS_OWNER, String(name || '')); } catch (e) {}
   }
 
+  // 「该账号已读到最后一页」的标记。存 localStorage 而不是 IDB meta：
+  // IDB 不可用（file:// / 隐私模式）时 meta 读写会静默失效，标记必须跨环境可靠。
+  const LS_ARCHIVE_FULL = 'tglp:archivefull:v1';
+  function archiveFullGet() {
+    try { return !!Store.accountKey && HWIN.localStorage.getItem(LS_ARCHIVE_FULL) === Store.accountKey; }
+    catch (e) { return false; }
+  }
+  function archiveFullSet(on) {
+    try {
+      if (!Store.accountKey) return;
+      if (on) HWIN.localStorage.setItem(LS_ARCHIVE_FULL, Store.accountKey);
+      else if (HWIN.localStorage.getItem(LS_ARCHIVE_FULL) === Store.accountKey) HWIN.localStorage.removeItem(LS_ARCHIVE_FULL);
+    } catch (e) {}
+  }
+
   function listAccounts() {
     try {
       const arr = JSON.parse(HWIN.localStorage.getItem(LS_ACCOUNTS) || '[]');
@@ -2882,6 +2902,8 @@
       if (!legacy.length) { HWIN.localStorage.setItem('tglp:migrated:v1', '1'); return 0; }
       await Store.use(key);
       if (!(await Store.all()).length) await Store.put(legacy);
+      // 旧版单库是「首次全量 + 之后增量」留下的，直接视为已全量
+      archiveFullSet(true);
       HWIN.localStorage.setItem('tglp:migrated:v1', '1');
       return legacy.length;
     } catch (e) { return 0; }
@@ -2999,8 +3021,9 @@
    * 第一次读全量写入 IndexedDB；以后只读头部，撞上已存记录就停（append-only）。
    * 若本轮有页读取失败，置 fullScanNeeded，下一轮强制整份重读补洞（自愈）。
    */
-  async function scanLogs() {
+  async function scanLogs(opts) {
     if (busy) return;
+    const mode = opts && opts.mode ? opts.mode : 'auto';
     busy = true;
     setButtonsDisabled(true);
     try {
@@ -3008,11 +3031,24 @@
       const range = logRange();
       logWindow = range;
 
+      // 首次扫描可能发生在账号识别之前（例如直接点统计）：先确保已切到该账号的库，
+      // 否则 archiveFull 这类按账号存的标记会写不进去。
+      if (!Store.accountKey) { try { await checkAccount(); } catch (e) {} }
+
       setLogStatus('读取本地存档…');
       const base = logAllRaw.length ? logAllRaw : await Store.all();
       const seen = new Set(base.map((r) => r.k));
       const existingCount = base.length;
       const forceFull = !!(await Store.getMeta('fullScanNeeded', false));
+      const archiveFull = archiveFullGet();
+      const wantFull = mode === 'full' || !!range.all;
+      // 目标范围起点：全量 → 0；按范围 → range.from。测试可传 opts.cutoff 精确控制。
+      const cutoff = opts && opts.cutoff != null ? num(opts.cutoff) : (wantFull ? 0 : (range.from || 0));
+      const earliest = base.length ? (base[base.length - 1].t || 0) : 0;
+      // 已确认全量存档 → 不需要补；否则目标全量要补，目标范围要看本地是否覆盖到起点
+      const needBackfill = archiveFull
+        ? false
+        : (wantFull ? true : (!!cutoff && (!base.length || earliest > cutoff)));
       const pending = [];
       let added = 0;
       let writeShort = 0;
@@ -3044,17 +3080,22 @@
       const v1 = await fetchPage(1);
       const totalPages = num(v1.TotalPages) || 1;
       let hitAnchor = false;
+      let reachedCutoff = false;
       const take = (items) => {
         for (let i = 0; i < (items || []).length; i++) {
           const it = items[i];
+          const ts = logTs(it.LogTime);
+          // 按范围统计：日志按时间倒序，遇到早于范围起点的记录即可停
+          if (cutoff && ts < cutoff) { reachedCutoff = true; return; }
           const k = logKey(it);
-          // 增量：撞上一条已存记录 = 后面都是老的，不用再读（本轮无失败页才可信）
           if (seen.has(k)) {
-            if (!failedPages.length && !forceFull) hitAnchor = true;
-            return;
+            // 增量：撞上已存记录 = 后面都是老的，不用再读（本轮无失败页才可信）
+            // 补历史：不能停，跳过已存记录继续往后读，直到范围起点或最后一页
+            if (!failedPages.length && !forceFull && !needBackfill) { hitAnchor = true; return; }
+            continue;
           }
           seen.add(k);
-          pending.push({ k, t: logTs(it.LogTime), v: it });
+          pending.push({ k, t: ts, v: it });
         }
       };
       take(v1.Items || []);
@@ -3063,7 +3104,7 @@
       setLogStatus(`读取 1 / ${totalPages} 页…（本地已存 ${existingCount} 条）`);
 
       let next = 2;
-      while (!hitAnchor && next <= totalPages) {
+      while (!hitAnchor && !reachedCutoff && next <= totalPages) {
         const block = [];
         for (let p = next; p < next + LOG_BLOCK && p <= totalPages; p++) block.push(p);
         const got = new Array(block.length);
@@ -3076,19 +3117,22 @@
           }
         });
         if (loginErr) throw loginErr;
-        for (let i = 0; i < got.length && !hitAnchor; i++) {
+        for (let i = 0; i < got.length && !hitAnchor && !reachedCutoff; i++) {
           if (got[i]) take(got[i].Items || []);
         }
         await flush();
         next += block.length;
         scanned = Math.min(next - 1, totalPages);
         setLogStatus(`读取 ${scanned} / ${totalPages} 页…（新 ${added + pending.length} 条）`);
-        if (!hitAnchor && next <= totalPages) await sleep(60);
+        if (!hitAnchor && !reachedCutoff && next <= totalPages) await sleep(60);
       }
 
       await flush();
       await Store.setMeta('lastScan', Date.now());
       await Store.setMeta('totalPages', totalPages);
+      // 读到了最后一页且没有失败页 → 本地存档已覆盖全部历史
+      const fullCovered = !failedPages.length && (wantFull || scanned >= totalPages);
+      if (fullCovered) archiveFullSet(true);
       // 有失败页 → 下轮强制全量重读补洞；否则清掉标记
       await Store.setMeta('fullScanNeeded', failedPages.length > 0);
 
@@ -3098,6 +3142,7 @@
       if (storedCount < seen.size) {
         writeShort = seen.size - storedCount;
         await Store.setMeta('fullScanNeeded', true);
+        archiveFullSet(false);
       }
       invalidateStatsCache();
       setLogStatus('生成统计存档…');
@@ -3143,6 +3188,7 @@ const st = cachedLedgerStats();
     } finally {
       busy = false;
       setButtonsDisabled(false);
+      syncFirstRunTip();
     }
   }
 
@@ -4542,8 +4588,19 @@ const st = cachedLedgerStats();
     const tableWrap = h('div', { class: 'tglp-tablewrap' },
       tableBar, tableScroll, pager);
 
+    /* 首次（该账号本地为空）提示：全量读取还是只读当前范围 */
+    const firstRunFull = h('button', { class: 'tglp-btn tglp-primary', type: 'button' }, '读取全部历史');
+    const firstRunRange = h('button', { class: 'tglp-btn', type: 'button' }, '只读当前范围');
+    const firstRunTip = h('div', { class: 'tglp-firstrun', hidden: 'hidden' },
+      h('div', { class: 'tglp-firstrun-t' }, '本地还没有这个账号的日志存档'),
+      h('div', { class: 'tglp-firstrun-d' }, '读取全部历史会翻完整份日志，较慢；只读当前范围更快，之后切到更大范围会自动补齐。'),
+      firstRunFull, firstRunRange);
+    firstRunFull.addEventListener('click', () => { firstRunTip.hidden = true; scanLogs({ mode: 'full' }); });
+    firstRunRange.addEventListener('click', () => { firstRunTip.hidden = true; scanLogs({ mode: 'range' }); });
+
     /* 主体：基础信息卡 → 图表卡片 → 详细数据表 */
     const main = h('div', { class: 'tglp-main' },
+      firstRunTip,
       chartBox,
       tableWrap,
       );
@@ -4567,6 +4624,7 @@ const st = cachedLedgerStats();
       starModeSel, starFilterSel, logStat,
       fundBar, fDir, fKind, fMode,
       pageSizeSel, pager, tableHead, tableBody, tableScroll,
+      firstRunTip, firstRunFull, firstRunRange,
       fundDir: 'out', fundKey: 'all', // 当前下钻方向与来源（点来源条会改）
     };
 
@@ -4583,6 +4641,12 @@ const st = cachedLedgerStats();
 
     /* ---- 交互（沿用工具箱账本） ---- */
     lDays.addEventListener('change', () => {
+      // 防误触：本地不是全量存档时，切到「全部」会触发大范围补读，先确认
+      if (lDays.value === 'all' && logAllRaw.length && !archiveFullGet()) {
+        let ok = true;
+        try { ok = HWIN.confirm('本地没有全部记录。\n切换到「全部」将读取全量历史数据，可能耗时较长，是否继续？'); } catch (e) {}
+        if (!ok) { lDays.value = String(S.logDays); return; }
+      }
       if (lDays.value === 'custom') {
         S.logDays = 'custom';
         if (!S.logFrom) S.logFrom = dayStr(dayStartMs(6));
@@ -4597,6 +4661,7 @@ const st = cachedLedgerStats();
       applyWindow();
       if (logAll.length) renderLedger();
       else setLogStatus('本地没有这段时间的数据，点「统计」补读');
+      maybeBackfillHistory();
     });
     [lFrom, lTo].forEach((inp) => inp.addEventListener('change', () => {
       if (lFrom.value && lTo.value && lFrom.value > lTo.value) {
@@ -4606,6 +4671,7 @@ const st = cachedLedgerStats();
       persist(); applyWindow();
       if (logAll.length) renderLedger();
       else setLogStatus('本地没有这段时间的数据，点「统计」补读');
+      maybeBackfillHistory();
     }));
     lDir.addEventListener('change', () => {
       S.logDir = lDir.value === 'loss' ? 'loss' : 'gain';
@@ -4677,7 +4743,15 @@ const st = cachedLedgerStats();
       else if (logAll.length) renderLedger();
       else renderLedger(); // 没数据时也要按视角清屏 / 显示 fundBar
     }));
-    lRun.addEventListener('click', scanLogs);
+    lRun.addEventListener('click', () => {
+    // 空存档时不让统计直接开始，先让用户选全量还是当前范围
+    if (!logAllRaw.length && els && els.firstRunTip) {
+      els.firstRunTip.hidden = false;
+      syncFirstRunTip();
+      return;
+    }
+    scanLogs();
+  });
     lCopy.addEventListener('click', copyLogs);
   }
 
@@ -4692,6 +4766,29 @@ const st = cachedLedgerStats();
    * 个性化面板的脚本可能比组件晚就绪 → 轮询等待 chiiLib.ukagaka。
    */
   const PANEL_TAB = 'tglp_ledger';
+
+  /** 该账号本地为空时显示首次提示（全量 / 只读当前范围）。 */
+  function syncFirstRunTip() {
+    if (!els || !els.firstRunTip) return;
+    const empty = !logAllRaw.length;
+    els.firstRunTip.hidden = !empty;
+    if (!empty) return;
+    const r = logRange();
+    if (els.firstRunRange) {
+      els.firstRunRange.hidden = !!r.all;
+      els.firstRunRange.textContent = '只读' + logRangeLabel(r);
+    }
+  }
+
+  /** 切到更大范围（尤其「全部」）但本地存档不全时，自动补读更早的历史。 */
+  function maybeBackfillHistory() {
+    if (busy || !logAllRaw.length || archiveFullGet()) return;
+    const r = logRange();
+    const earliest = logAllRaw[logAllRaw.length - 1].t || 0;
+    if (!r.all && !(r.from && earliest > r.from)) return;
+    scanLogs();
+  }
+
   async function openLedger() {
     if (!els) buildUI();
     els.panel.hidden = false;
@@ -4700,7 +4797,9 @@ const st = cachedLedgerStats();
     await ensureLocal();
     loadHoldings();
     renderLedger();
-    if (acc && acc.switched) setTimeout(() => scanLogs(), 300);
+    syncFirstRunTip();
+    // 换到有存档的账号才自动增量；换到空账号先让用户选全量还是当前范围
+    if (acc && acc.switched && logAllRaw.length) setTimeout(() => scanLogs(), 300);
   }
 
   function registerCustomizeTab(tries) {
@@ -4787,6 +4886,7 @@ const st = cachedLedgerStats();
     if (location.protocol === 'file:' || /[?&]tglp-test=1/.test(location.search)) {
       HWIN.__TGLP_T__ = {
         boot, scanLogs, logRange, applyWindow, ledgerStats, logStats, logKey,
+        syncFirstRunTip, archiveFullGet,
         buildUI, togglePanel, openLedger, registerCustomizeTab, loadLocal, renderLedger,
         fundDrill, monthlyFlow, fundKindOf, hbarSvg, donutSvg, monthlySvg,
         gotoPage, pageCount,

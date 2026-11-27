@@ -1152,6 +1152,43 @@ const test = `
   var acctKeys2 = T.listAccounts().map(function (x) { return x.key; });
   ok('删除账号后列表移除', acctKeys2.indexOf('another-user') < 0, acctKeys2.join(','));
 
+  /* ---------- 首次提示 / 按范围统计 / 切全量补历史 ---------- */
+  await T.storeClear();
+  T.clearLocal();
+  localStorage.removeItem('tglp:archivefull:v1');
+  T.syncFirstRunTip();
+  var firstTipEl = doc.querySelector('.tglp-firstrun');
+  ok('空存档时显示首次提示条', !!firstTipEl && !firstTipEl.hidden,
+    firstTipEl ? 'hidden=' + firstTipEl.hidden : 'none');
+
+  window.__PAGES = 160;
+  window.__extraHead = 0;
+  window.__calls.length = 0;
+  T.setRange('2000-01-01', '2030-01-01', 'custom');
+  var cutoffTs = Date.parse('2026-10-31T00:00:00') - 50 * 1000000;
+  await T.scanLogs({ mode: 'range', cutoff: cutoffTs });
+  var rawRange = T.state().raw;
+  var callsRange = window.__calls.filter(function (c) { return c.indexOf('balance/') >= 0; }).length;
+  ok('按范围统计只读范围以内的日志', rawRange > 100 && rawRange < 200 && callsRange < 80,
+    'raw=' + rawRange + ' calls=' + callsRange + ' cutoff=' + cutoffTs);
+  ok('范围统计后不标记为已全量', !T.archiveFullGet(), 'full=' + T.archiveFullGet());
+
+  // 防误触：未全量时切到「全部」先确认；取消则恢复原范围
+  var lDaysEl = doc.getElementById('tglp-ldays');
+  var confirmCalls = 0;
+  window.confirm = function () { confirmCalls++; return false; };
+  lDaysEl.value = 'all';
+  lDaysEl.dispatchEvent(new Event('change'));
+  ok('切到全部前提示确认（取消不切换）',
+    confirmCalls === 1 && lDaysEl.value !== 'all',
+    'calls=' + confirmCalls + ' value=' + lDaysEl.value);
+  window.confirm = function () { return true; };
+
+  await T.scanLogs({ mode: 'full' });
+  var rawFull = T.state().raw;
+  ok('切到全量自动补更早历史', rawFull >= 320, 'raw=' + rawFull);
+  ok('补全后标记为已全量', !!T.archiveFullGet(), 'full=' + T.archiveFullGet());
+
   clearInterval(__tick);
   out.textContent = lines.join('~|~') + '~|~END~|~';
   } catch (err) {

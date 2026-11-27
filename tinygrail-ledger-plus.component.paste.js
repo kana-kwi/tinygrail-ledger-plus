@@ -1,5 +1,5 @@
 /**
- * 小圣杯账本2.0 v1.6.1 —— 启动懒加载 / 多账号存档 / 账号管理 / Alt+L
+ * 小圣杯账本2.0 v1.6.3 —— 切全部前确认 / 首次范围选择 / 多账号存档
  */
 (function () {
   'use strict';
@@ -1767,6 +1767,11 @@
 .tglp-acct-del:hover{color:var(--tl-down,#c0392b);border-color:var(--tl-down,#c0392b)}
 .tglp-acct-empty,.tglp-acct-tip{font-size:11px;color:var(--tl-dim);padding:6px}
 .tglp-acct-tip{border-top:1px solid var(--tl-line-soft);margin-top:6px}
+.tglp-firstrun{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px;
+  padding:10px 12px;border:1px solid var(--tl-line-soft);border-radius:10px;background:var(--tl-surface)}
+.tglp-firstrun[hidden]{display:none}
+.tglp-firstrun-t{font-size:12px;font-weight:600;color:var(--tl-fg);white-space:nowrap}
+.tglp-firstrun-d{font-size:11px;color:var(--tl-dim);flex:1 1 260px;line-height:1.5}
 .tglp-topbar .tglp-line{margin:0;gap:5px}
 .tglp-topbar .tglp-label{font-size:11px;color:var(--tl-dim);white-space:nowrap}
 .tglp-topbar select,.tglp-topbar input[type=date]{height:25px;padding:0 5px;font-size:12px;border-radius:5px}
@@ -2546,6 +2551,19 @@
     try { HWIN.localStorage.setItem(LS_OWNER, String(name || '')); } catch (e) {}
   }
 
+  const LS_ARCHIVE_FULL = 'tglp:archivefull:v1';
+  function archiveFullGet() {
+    try { return !!Store.accountKey && HWIN.localStorage.getItem(LS_ARCHIVE_FULL) === Store.accountKey; }
+    catch (e) { return false; }
+  }
+  function archiveFullSet(on) {
+    try {
+      if (!Store.accountKey) return;
+      if (on) HWIN.localStorage.setItem(LS_ARCHIVE_FULL, Store.accountKey);
+      else if (HWIN.localStorage.getItem(LS_ARCHIVE_FULL) === Store.accountKey) HWIN.localStorage.removeItem(LS_ARCHIVE_FULL);
+    } catch (e) {}
+  }
+
   function listAccounts() {
     try {
       const arr = JSON.parse(HWIN.localStorage.getItem(LS_ACCOUNTS) || '[]');
@@ -2590,6 +2608,7 @@
       if (!legacy.length) { HWIN.localStorage.setItem('tglp:migrated:v1', '1'); return 0; }
       await Store.use(key);
       if (!(await Store.all()).length) await Store.put(legacy);
+      archiveFullSet(true);
       HWIN.localStorage.setItem('tglp:migrated:v1', '1');
       return legacy.length;
     } catch (e) { return 0; }
@@ -2694,8 +2713,9 @@
     }
   }
 
-  async function scanLogs() {
+  async function scanLogs(opts) {
     if (busy) return;
+    const mode = opts && opts.mode ? opts.mode : 'auto';
     busy = true;
     setButtonsDisabled(true);
     try {
@@ -2703,11 +2723,20 @@
       const range = logRange();
       logWindow = range;
 
+      if (!Store.accountKey) { try { await checkAccount(); } catch (e) {} }
+
       setLogStatus('读取本地存档…');
       const base = logAllRaw.length ? logAllRaw : await Store.all();
       const seen = new Set(base.map((r) => r.k));
       const existingCount = base.length;
       const forceFull = !!(await Store.getMeta('fullScanNeeded', false));
+      const archiveFull = archiveFullGet();
+      const wantFull = mode === 'full' || !!range.all;
+      const cutoff = opts && opts.cutoff != null ? num(opts.cutoff) : (wantFull ? 0 : (range.from || 0));
+      const earliest = base.length ? (base[base.length - 1].t || 0) : 0;
+      const needBackfill = archiveFull
+        ? false
+        : (wantFull ? true : (!!cutoff && (!base.length || earliest > cutoff)));
       const pending = [];
       let added = 0;
       let writeShort = 0;
@@ -2737,16 +2766,19 @@
       const v1 = await fetchPage(1);
       const totalPages = num(v1.TotalPages) || 1;
       let hitAnchor = false;
+      let reachedCutoff = false;
       const take = (items) => {
         for (let i = 0; i < (items || []).length; i++) {
           const it = items[i];
+          const ts = logTs(it.LogTime);
+          if (cutoff && ts < cutoff) { reachedCutoff = true; return; }
           const k = logKey(it);
           if (seen.has(k)) {
-            if (!failedPages.length && !forceFull) hitAnchor = true;
-            return;
+            if (!failedPages.length && !forceFull && !needBackfill) { hitAnchor = true; return; }
+            continue;
           }
           seen.add(k);
-          pending.push({ k, t: logTs(it.LogTime), v: it });
+          pending.push({ k, t: ts, v: it });
         }
       };
       take(v1.Items || []);
@@ -2755,7 +2787,7 @@
       setLogStatus(`读取 1 / ${totalPages} 页…（本地已存 ${existingCount} 条）`);
 
       let next = 2;
-      while (!hitAnchor && next <= totalPages) {
+      while (!hitAnchor && !reachedCutoff && next <= totalPages) {
         const block = [];
         for (let p = next; p < next + LOG_BLOCK && p <= totalPages; p++) block.push(p);
         const got = new Array(block.length);
@@ -2768,19 +2800,21 @@
           }
         });
         if (loginErr) throw loginErr;
-        for (let i = 0; i < got.length && !hitAnchor; i++) {
+        for (let i = 0; i < got.length && !hitAnchor && !reachedCutoff; i++) {
           if (got[i]) take(got[i].Items || []);
         }
         await flush();
         next += block.length;
         scanned = Math.min(next - 1, totalPages);
         setLogStatus(`读取 ${scanned} / ${totalPages} 页…（新 ${added + pending.length} 条）`);
-        if (!hitAnchor && next <= totalPages) await sleep(60);
+        if (!hitAnchor && !reachedCutoff && next <= totalPages) await sleep(60);
       }
 
       await flush();
       await Store.setMeta('lastScan', Date.now());
       await Store.setMeta('totalPages', totalPages);
+      const fullCovered = !failedPages.length && (wantFull || scanned >= totalPages);
+      if (fullCovered) archiveFullSet(true);
       await Store.setMeta('fullScanNeeded', failedPages.length > 0);
 
       setLogStatus(`读取完成（新增 ${added} 条），整理本地存档…`);
@@ -2789,6 +2823,7 @@
       if (storedCount < seen.size) {
         writeShort = seen.size - storedCount;
         await Store.setMeta('fullScanNeeded', true);
+        archiveFullSet(false);
       }
       invalidateStatsCache();
       setLogStatus('生成统计存档…');
@@ -2833,6 +2868,7 @@ const st = cachedLedgerStats();
     } finally {
       busy = false;
       setButtonsDisabled(false);
+      syncFirstRunTip();
     }
   }
 
@@ -4158,7 +4194,17 @@ const st = cachedLedgerStats();
     const tableWrap = h('div', { class: 'tglp-tablewrap' },
       tableBar, tableScroll, pager);
 
+    const firstRunFull = h('button', { class: 'tglp-btn tglp-primary', type: 'button' }, '读取全部历史');
+    const firstRunRange = h('button', { class: 'tglp-btn', type: 'button' }, '只读当前范围');
+    const firstRunTip = h('div', { class: 'tglp-firstrun', hidden: 'hidden' },
+      h('div', { class: 'tglp-firstrun-t' }, '本地还没有这个账号的日志存档'),
+      h('div', { class: 'tglp-firstrun-d' }, '读取全部历史会翻完整份日志，较慢；只读当前范围更快，之后切到更大范围会自动补齐。'),
+      firstRunFull, firstRunRange);
+    firstRunFull.addEventListener('click', () => { firstRunTip.hidden = true; scanLogs({ mode: 'full' }); });
+    firstRunRange.addEventListener('click', () => { firstRunTip.hidden = true; scanLogs({ mode: 'range' }); });
+
     const main = h('div', { class: 'tglp-main' },
+      firstRunTip,
       chartBox,
       tableWrap,
       );
@@ -4182,6 +4228,7 @@ const st = cachedLedgerStats();
       starModeSel, starFilterSel, logStat,
       fundBar, fDir, fKind, fMode,
       pageSizeSel, pager, tableHead, tableBody, tableScroll,
+      firstRunTip, firstRunFull, firstRunRange,
       fundDir: 'out', fundKey: 'all', // 当前下钻方向与来源（点来源条会改）
     };
 
@@ -4194,6 +4241,11 @@ const st = cachedLedgerStats();
     }
 
     lDays.addEventListener('change', () => {
+      if (lDays.value === 'all' && logAllRaw.length && !archiveFullGet()) {
+        let ok = true;
+        try { ok = HWIN.confirm('本地没有全部记录。\n切换到「全部」将读取全量历史数据，可能耗时较长，是否继续？'); } catch (e) {}
+        if (!ok) { lDays.value = String(S.logDays); return; }
+      }
       if (lDays.value === 'custom') {
         S.logDays = 'custom';
         if (!S.logFrom) S.logFrom = dayStr(dayStartMs(6));
@@ -4208,6 +4260,7 @@ const st = cachedLedgerStats();
       applyWindow();
       if (logAll.length) renderLedger();
       else setLogStatus('本地没有这段时间的数据，点「统计」补读');
+      maybeBackfillHistory();
     });
     [lFrom, lTo].forEach((inp) => inp.addEventListener('change', () => {
       if (lFrom.value && lTo.value && lFrom.value > lTo.value) {
@@ -4217,6 +4270,7 @@ const st = cachedLedgerStats();
       persist(); applyWindow();
       if (logAll.length) renderLedger();
       else setLogStatus('本地没有这段时间的数据，点「统计」补读');
+      maybeBackfillHistory();
     }));
     lDir.addEventListener('change', () => {
       S.logDir = lDir.value === 'loss' ? 'loss' : 'gain';
@@ -4287,7 +4341,14 @@ const st = cachedLedgerStats();
       else if (logAll.length) renderLedger();
       else renderLedger(); // 没数据时也要按视角清屏 / 显示 fundBar
     }));
-    lRun.addEventListener('click', scanLogs);
+    lRun.addEventListener('click', () => {
+    if (!logAllRaw.length && els && els.firstRunTip) {
+      els.firstRunTip.hidden = false;
+      syncFirstRunTip();
+      return;
+    }
+    scanLogs();
+  });
     lCopy.addEventListener('click', copyLogs);
   }
 
@@ -4297,6 +4358,27 @@ const st = cachedLedgerStats();
   }
 
   const PANEL_TAB = 'tglp_ledger';
+
+  function syncFirstRunTip() {
+    if (!els || !els.firstRunTip) return;
+    const empty = !logAllRaw.length;
+    els.firstRunTip.hidden = !empty;
+    if (!empty) return;
+    const r = logRange();
+    if (els.firstRunRange) {
+      els.firstRunRange.hidden = !!r.all;
+      els.firstRunRange.textContent = '只读' + logRangeLabel(r);
+    }
+  }
+
+  function maybeBackfillHistory() {
+    if (busy || !logAllRaw.length || archiveFullGet()) return;
+    const r = logRange();
+    const earliest = logAllRaw[logAllRaw.length - 1].t || 0;
+    if (!r.all && !(r.from && earliest > r.from)) return;
+    scanLogs();
+  }
+
   async function openLedger() {
     if (!els) buildUI();
     els.panel.hidden = false;
@@ -4304,7 +4386,8 @@ const st = cachedLedgerStats();
     await ensureLocal();
     loadHoldings();
     renderLedger();
-    if (acc && acc.switched) setTimeout(() => scanLogs(), 300);
+    syncFirstRunTip();
+    if (acc && acc.switched && logAllRaw.length) setTimeout(() => scanLogs(), 300);
   }
 
   function registerCustomizeTab(tries) {
@@ -4382,6 +4465,7 @@ const st = cachedLedgerStats();
     if (location.protocol === 'file:' || /[?&]tglp-test=1/.test(location.search)) {
       HWIN.__TGLP_T__ = {
         boot, scanLogs, logRange, applyWindow, ledgerStats, logStats, logKey,
+        syncFirstRunTip, archiveFullGet,
         buildUI, togglePanel, openLedger, registerCustomizeTab, loadLocal, renderLedger,
         fundDrill, monthlyFlow, fundKindOf, hbarSvg, donutSvg, monthlySvg,
         gotoPage, pageCount,
